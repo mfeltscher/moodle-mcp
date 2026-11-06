@@ -496,19 +496,25 @@ def get_assignment_status(assignid: int) -> AssignmentStatus:
 
     to_json_file(data, f"assignment_status_{assignid}.json")
 
-    lastattempt = data.get("lastattempt", {})
-    submission = lastattempt.get("submission", {})
-    assignment_info = data.get("assignment", data.get("config", {}))
+    # Moodle sends JSON null for fields that are not set (e.g. extensionduedate
+    # when no extension was granted), so `.get(key, default)` is not enough:
+    # coerce None to the default as well, otherwise the AssignmentStatus
+    # output schema rejects the result.
+    lastattempt = data.get("lastattempt") or {}
+    # Group assignments report the submission under "teamsubmission".
+    submission = lastattempt.get("teamsubmission") or lastattempt.get("submission") or {}
+    assignment_info = data.get("assignment") or data.get("config") or {}
+    submission_status = submission.get("status")
 
     return {
-        "submission_status": submission.get("status"),
+        "submission_status": submission_status,
         "grading_status": lastattempt.get("gradingstatus"),
-        "duedate": assignment_info.get("duedate", 0),
-        "cutoffdate": assignment_info.get("cutoffdate", 0),
-        "extensionduedate": lastattempt.get("extensionduedate", 0),
-        "late": lastattempt.get("late", False),
-        "submitted": submission.get("status") == "submitted",
-        "graded": lastattempt.get("graded", False),
+        "duedate": assignment_info.get("duedate") or 0,
+        "cutoffdate": assignment_info.get("cutoffdate") or 0,
+        "extensionduedate": lastattempt.get("extensionduedate") or 0,
+        "late": bool(lastattempt.get("late")),
+        "submitted": submission_status == "submitted",
+        "graded": bool(lastattempt.get("graded")),
     }
 
 
@@ -1000,8 +1006,9 @@ def get_course_announcements(courseid: int | None = None) -> list[CourseAnnounce
         # Step 4: Get discussions from this forum
         try:
             discussions_data = get_moodle_api_data(
-                APIFunction.mod_forum_get_discussions,
-                params={"forumid": str(forum_id), "perpage": "20"},
+                APIFunction.mod_forum_get_forum_discussions,
+                # page defaults to -1; Moodle computes the offset as page * perpage
+                params={"forumid": str(forum_id), "page": "0", "perpage": "20"},
             )
         except MoodleAPIError as e:
             logger.warning(f"Could not get discussions for forum {forum_id}: {e}")
