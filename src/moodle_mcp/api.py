@@ -1,12 +1,19 @@
+import os
 import re
+import tempfile
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import urlparse
 from typing_extensions import TypedDict
 
+import requests
 from glom import Coalesce, glom
 
 from .logger import logger
 from .moodle import (
+    MOODLE_TOKEN,
+    MOODLE_URL,
     APIFunction,
     MoodleAPIError,
     format_moodle_array_params,
@@ -2236,6 +2243,145 @@ def create_implementation_plan(assignid: int) -> ImplementationPlan:
         "milestones": milestones,
         "risk_factors": risk_factors,
     }
+
+
+# ---------------------------------------------------------------------------
+# Tool: download_course_files
+# ---------------------------------------------------------------------------
+
+# Modules whose "contents" are real course files worth saving.
+_DOWNLOADABLE_MODULES = {"folder", "resource"}
+_UNSAFE_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+
+
+class DownloadedFile(TypedDict):
+    path: str
+    size: int
+    status: str  # "downloaded" | "skipped" | "error"
+    error: str | None
+
+
+class DownloadResult(TypedDict):
+    target_dir: str
+    downloaded: int
+    skipped: int
+    failed: int
+    files: list[DownloadedFile]
+
+
+def _safe_component(name: str) -> str:
+    """Make one path component safe for any OS (no separators or dot-only names)."""
+    cleaned = _UNSAFE_CHARS.sub("-", name or "").strip().strip(".").strip()
+    return cleaned or "_"
+
+
+def _default_course_folder(courseid: int) -> str:
+    for course in get_my_courses():
+        if course["id"] == courseid:
+            return course["fullname"]
+    return str(courseid)
+
+
+def download_course_files(
+    courseid: int,
+    target_dir: str,
+    folder_name: str | None = None,
+    overwrite: bool = False,
+) -> DownloadResult:
+    """Download all files of a course, mirroring its Moodle structure.
+
+    Files land in <target_dir>/<folder_name>/<section>/[<module>/]<subfolders>/<file>.
+    The module name is only added when a section holds more than one folder or
+    file module. Files that already exist with the same size are skipped
+    unless overwrite is True.
+    """
+    target = Path(target_dir).expanduser()
+    if not target.is_absolute():
+        raise ValueError("target_dir must be an absolute path")
+    course_dir = (target / _safe_component(folder_name or _default_course_folder(courseid))).resolve()
+    moodle_host = urlparse(MOODLE_URL or "").netloc
+
+    sections = get_moodle_api_data(
+        APIFunction.core_course_get_contents,
+        params={"courseid": str(courseid)},
+    )
+
+    files: list[DownloadedFile] = []
+    for section in sections:
+        modules = [
+            m for m in section.get("modules") or []
+            if m.get("modname") in _DOWNLOADABLE_MODULES and m.get("contents")
+        ]
+        section_dir = course_dir / _safe_component(section.get("name") or f"Section {section.get('section', '')}")
+        for module in modules:
+            module_dir = section_dir
+            if len(modules) > 1:
+                module_dir = module_dir / _safe_component(module.get("name", ""))
+            for content in module.get("contents") or []:
+                if content.get("type") != "file":
+                    continue
+                subdirs = [
+                    _safe_component(part)
+                    for part in (content.get("filepath") or "/").split("/")
+                    if part
+                ]
+                dest = module_dir.joinpath(*subdirs, _safe_component(content.get("filename", "")))
+                files.append(_download_one(content, dest, course_dir, moodle_host, overwrite))
+
+    result: DownloadResult = {
+        "target_dir": str(course_dir),
+        "downloaded": sum(f["status"] == "downloaded" for f in files),
+        "skipped": sum(f["status"] == "skipped" for f in files),
+        "failed": sum(f["status"] == "error" for f in files),
+        "files": files,
+    }
+    logger.info(
+        f"Course {courseid}: {result['downloaded']} downloaded, "
+        f"{result['skipped']} skipped, {result['failed']} failed"
+    )
+    return result
+
+
+def _download_one(
+    content: dict, dest: Path, course_dir: Path, moodle_host: str, overwrite: bool
+) -> DownloadedFile:
+    size = int(content.get("filesize") or 0)
+    entry: DownloadedFile = {"path": str(dest), "size": size, "status": "error", "error": None}
+    try:
+        dest = dest.resolve()
+        if course_dir not in dest.parents:
+            raise ValueError("file path escapes the course folder")
+        fileurl = content.get("fileurl") or ""
+        if urlparse(fileurl).netloc != moodle_host:
+            raise ValueError("file URL is not on the configured Moodle host")
+
+        if dest.exists() and not overwrite and dest.stat().st_size == size:
+            entry["status"] = "skipped"
+            return entry
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with requests.get(fileurl, params={"token": MOODLE_TOKEN}, stream=True, timeout=60) as rsp:
+            if rsp.status_code != 200:
+                raise ValueError(f"HTTP {rsp.status_code}")
+            if "application/json" in rsp.headers.get("content-type", ""):
+                # Moodle reports pluginfile errors as JSON instead of the file.
+                raise ValueError(rsp.text[:200])
+            fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=".moodle-dl-")
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    for chunk in rsp.iter_content(chunk_size=1 << 16):
+                        fh.write(chunk)
+                os.replace(tmp, dest)
+            except BaseException:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+                raise
+        entry["size"] = dest.stat().st_size
+        entry["status"] = "downloaded"
+    except Exception as e:  # one bad file must not stop the rest
+        entry["error"] = str(e)
+        logger.warning(f"Could not download {dest}: {e}")
+    return entry
 
 
 if __name__ == "__main__":

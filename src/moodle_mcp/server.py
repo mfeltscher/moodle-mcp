@@ -25,6 +25,23 @@ def get_course_content(courseid: int) -> list[api.CourseSection]:
 
 
 @mcp.tool()
+def download_course_files(
+    courseid: int,
+    target_dir: str,
+    folder_name: str | None = None,
+    overwrite: bool = False,
+) -> api.DownloadResult:
+    """Download all files of a course (folder and file resources) to a local directory.
+
+    Files are saved as <target_dir>/<folder_name>/<section>/[<module>/]<subfolders>/<file>,
+    mirroring the Moodle structure. folder_name defaults to the course's full name.
+    target_dir must be an absolute path. Files that already exist with the same size
+    are skipped unless overwrite is true.
+    """
+    return api.download_course_files(courseid, target_dir, folder_name, overwrite)
+
+
+@mcp.tool()
 def get_assignments(courseids: list[int] | None = None) -> list[api.Assignment]:
     """Get assignments for courses. Optionally filter by course IDs. Returns all enrolled courses' assignments if no course IDs are provided."""
     return api.get_assignments(courseids)

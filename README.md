@@ -14,6 +14,7 @@ The server exposes the following tools.
 | --- | --- |
 | `get_my_courses` | Get all courses the current user is enrolled in |
 | `get_course_content` | Get sections and modules for a specific course by its ID |
+| `download_course_files` | Download all files of a course into a local folder, mirroring its sections and subfolders; already downloaded files are skipped |
 | `search_course_materials` | Search across all course materials by query string |
 | `get_course_announcements` | Get announcements from course news forums, optionally filtered by course ID |
 | `get_recent_activity` | Get recent activity and updates across courses since a given time |
